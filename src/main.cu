@@ -9,6 +9,7 @@
 #include "tile2csr.h"
 #include "spgemm_serialref_spa_new.h"
 #include "spgemm_cu.h"
+#include "reorder.h"
 
 int main(int argc, char ** argv)
 {
@@ -23,6 +24,8 @@ int main(int argc, char ** argv)
     
     int device_id = 0;
     int aat = 0;
+    int reorder = 0;
+    int reorder_materialized = 0;
 
     // "Usage: ``./test -d 0 -aat 0 A.mtx'' for C=AA  on device 0", or
     // "Usage: ``./test -d 0 -aat 1 A.mtx'' for C=AAT on device 0"
@@ -74,12 +77,40 @@ int main(int argc, char ** argv)
         argi++;
     }
 
+    char *filename = NULL;
+    while (argi < argc)
+    {
+        if (strcmp(argv[argi], "-reorder") == 0)
+        {
+            argi++;
+            if (argi >= argc)
+            {
+                printf("Missing value for -reorder.\n");
+                return 0;
+            }
+            reorder = atoi(argv[argi]);
+            argi++;
+        }
+        else
+        {
+            filename = argv[argi];
+            argi++;
+        }
+    }
+
+    if (filename == NULL)
+    {
+        printf("Run the code by './test -d 0 -aat 0 [-reorder 1] matrix.mtx'.\n");
+        return 0;
+    }
+
  	struct timeval t1, t2;
 	SMatrix *matrixA = (SMatrix *)malloc(sizeof(SMatrix));
+	SMatrix *matrixA_original = matrixA;
+	SMatrix *matrixA_reordered = NULL;
+	SMatrix *matrixB_reordered = NULL;
 	SMatrix *matrixB = (SMatrix *)malloc(sizeof(SMatrix));
 
-	char  *filename;
-    filename = argv[argi];
     printf("MAT: -------------- %s --------------\n", filename);
 
     // load mtx A data to the csr format
@@ -99,6 +130,88 @@ int main(int argc, char ** argv)
 
 	for (int i = 0; i < matrixA->nnz; i++)
 	    matrixA->value[i] = i % 10;
+
+    ReorderInfo reorder_info;
+    reorder_info_init(&reorder_info);
+
+    if (reorder)
+    {
+        if (aat)
+        {
+            printf("reorder supports only -aat 0 in this version. Exit.\n");
+            return 0;
+        }
+
+        printf("reorder enabled\n");
+        printf("reorder strategy = TASA-5x\n");
+        gettimeofday(&t1, NULL);
+
+        int reorder_status = build_gtsp_permutation(matrixA_original, &reorder_info);
+        if (reorder_status != 0)
+        {
+            printf("reorder failed, status = %d. Exit.\n", reorder_status);
+            return 0;
+        }
+
+        if (reorder_info.guard_degraded_to_identity)
+        {
+            matrixB->m = matrixA_original->m;
+            matrixB->n = matrixA_original->n;
+            matrixB->nnz = matrixA_original->nnz;
+            matrixB->rowpointer = matrixA_original->rowpointer;
+            matrixB->columnindex = matrixA_original->columnindex;
+            matrixB->value = matrixA_original->value;
+            matrixA = matrixA_original;
+        }
+        else
+        {
+            struct timeval tp1, tp2;
+            gettimeofday(&tp1, NULL);
+            matrixA_reordered = (SMatrix *)malloc(sizeof(SMatrix));
+            memset(matrixA_reordered, 0, sizeof(SMatrix));
+            reorder_status = apply_bipermutation_csr(matrixA_original, &reorder_info.row_perm, &reorder_info.inner_perm, matrixA_reordered);
+            if (reorder_status != 0)
+            {
+                printf("reorder apply A failed, status = %d. Exit.\n", reorder_status);
+                return 0;
+            }
+
+            matrixB_reordered = matrixB;
+            memset(matrixB_reordered, 0, sizeof(SMatrix));
+            reorder_status = apply_bipermutation_csr(matrixA_original, &reorder_info.inner_perm, &reorder_info.col_perm, matrixB_reordered);
+            if (reorder_status != 0)
+            {
+                printf("reorder apply B failed, status = %d. Exit.\n", reorder_status);
+                return 0;
+            }
+            gettimeofday(&tp2, NULL);
+            reorder_info.permute_time_ms = (tp2.tv_sec - tp1.tv_sec) * 1000.0 + (tp2.tv_usec - tp1.tv_usec) / 1000.0;
+
+            matrixA = matrixA_reordered;
+            matrixB = matrixB_reordered;
+            reorder_materialized = 1;
+        }
+
+        gettimeofday(&t2, NULL);
+        reorder_info.reorder_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+        printf("reorder time = %.2f ms\n", reorder_info.reorder_time_ms);
+        printf("reorder signature time = %.2f ms\n", reorder_info.signature_time_ms);
+        printf("reorder tile profile time = %.2f ms\n", reorder_info.tile_profile_time_ms);
+        printf("reorder affinity time = %.2f ms\n", reorder_info.affinity_time_ms);
+        printf("reorder sort time = %.2f ms\n", reorder_info.sort_time_ms);
+        printf("reorder local refine time = %.2f ms\n", reorder_info.local_refine_time_ms);
+        printf("reorder local refine window = %d\n", reorder_info.local_refine_window);
+        printf("reorder proxy time = %.2f ms\n", reorder_info.proxy_time_ms);
+        printf("reorder permute time = %.2f ms\n", reorder_info.permute_time_ms);
+        if (reorder_info.guard_degraded_to_identity)
+            printf("reorder degraded to identity by proxy\n");
+        printf("input tiles A before reorder = %lld\n", reorder_info.input_tiles_A_before);
+        printf("input tiles A after reorder = %lld\n", reorder_info.input_tiles_A_after);
+        printf("input tiles B before reorder = %lld\n", reorder_info.input_tiles_B_before);
+        printf("input tiles B after reorder = %lld\n", reorder_info.input_tiles_B_after);
+        printf("estimated C tiles before reorder = %lld\n", reorder_info.estimated_c_tiles_before);
+        printf("estimated C tiles after reorder = %lld\n", reorder_info.estimated_c_tiles_after);
+    }
 
     if (aat)
     {
@@ -129,7 +242,7 @@ int main(int argc, char ** argv)
 
 
     }
-    else
+    else if (!reorder)
     {
         matrixB->m = matrixA->m ;
         matrixB->n = matrixA->n ;
@@ -318,12 +431,29 @@ tile2csr(matrixC);
     int nnzC_golden = matrixC->nnz;
     bool check_result = CHECK_RESULT;
 
+    if (reorder_materialized)
+    {
+        gettimeofday(&t1, NULL);
+        int restore_status = restore_bipermutation_csr(matrixC, &reorder_info.row_perm, &reorder_info.col_perm);
+        gettimeofday(&t2, NULL);
+        double time_restore = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+        if (restore_status != 0)
+        {
+            printf("restore reorder result failed, status = %d. Exit.\n", restore_status);
+            return 0;
+        }
+        printf("restore reorder result uses %.2f ms\n", time_restore);
+    }
+
     MAT_PTR_TYPE *csrRowPtrC_golden = matrixC->rowpointer;
     int *csrColIdxC_golden = matrixC->columnindex;
     MAT_VAL_TYPE *csrValC_golden = matrixC->value;
 
-    spgemm_cu(matrixA->m, matrixA->n, matrixA->nnz, matrixA->rowpointer, matrixA->columnindex, matrixA->value,
-              matrixB->m, matrixB->n, matrixB->nnz, matrixB->rowpointer, matrixB->columnindex, matrixB->value,
+    SMatrix *matrixA_check = reorder ? matrixA_original : matrixA;
+    SMatrix *matrixB_check = reorder ? matrixA_original : matrixB;
+
+    spgemm_cu(matrixA_check->m, matrixA_check->n, matrixA_check->nnz, matrixA_check->rowpointer, matrixA_check->columnindex, matrixA_check->value,
+              matrixB_check->m, matrixB_check->n, matrixB_check->nnz, matrixB_check->rowpointer, matrixB_check->columnindex, matrixB_check->value,
               mC, nC, nnzC_golden, csrRowPtrC_golden, csrColIdxC_golden, csrValC_golden,
               check_result, nnzCub, &nnzC, &compression_rate1, &time_cusparse, &gflops_cusparse);
     printf("---------------------------------------------------------------\n");
@@ -335,6 +465,18 @@ tile2csr(matrixC);
     free(matrixA->rowpointer);
     free(matrixA->columnindex);
     free(matrixA->value);
+
+    if (reorder_materialized)
+    {
+        free(matrixB->rowpointer);
+        free(matrixB->columnindex);
+        free(matrixB->value);
+        free(matrixA_original->rowpointer);
+        free(matrixA_original->columnindex);
+        free(matrixA_original->value);
+    }
+    if (reorder)
+        reorder_info_destroy(&reorder_info);
 
     return 0;
 
