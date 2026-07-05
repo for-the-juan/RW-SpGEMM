@@ -1,0 +1,9 @@
+CUDA error 700 [/data/apps/cuda/12.4/include/cub/util_device.cuh, 89]: an illegal memory access was encountered
+CUDA error 101 [/data/apps/cuda/12.4/include/cub/util_device.cuh, 108]: invalid device ordinal
+CUDA error 700 [/data/apps/cuda/12.4/include/cub/util_device.cuh, 314]: an illegal memory access was encountered
+CUDA error 700 [/data/apps/cuda/12.4/include/cub/util_device.cuh, 397]: an illegal memory access was encountered
+CUDA error 700 [/data/apps/cuda/12.4/include/cub/device/dispatch/dispatch_scan.cuh, 595]: an illegal memory access was encountered
+terminate called after throwing an instance of 'thrust::THRUST_200301_900_NS::system::system_error'
+  what():  after determining tmp storage requirements for exclusive_scan: cudaErrorIllegalAddress: an illegal memory access was encountered
+/var/spool/slurmd/job30802/slurm_script: line 13: 458735 Aborted                 (core dumped) ./src/test -d 0 -aat 0 $mtx_file > /data/home/scwb383/run/TileSpGEMM_log/training_dataset/${base_name_}.log
+slurmstepd: error: *** JOB 30802 ON d1n42e29g02 CANCELLED AT 2026-03-10T12:40:43 ***
