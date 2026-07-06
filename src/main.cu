@@ -16,7 +16,7 @@ int main(int argc, char ** argv)
 
 	if (argc < 6)
     {
-        printf("Run the code by './test -d 0 -aat 0 matrix.mtx'.\n");
+        printf("Run the code by './test -d 0 -aat 0 matrixA.mtx [-b matrixB.mtx] [-reorder 1]'.\n");
         return 0;
     }
 	
@@ -26,6 +26,7 @@ int main(int argc, char ** argv)
     int aat = 0;
     int reorder = 0;
     int reorder_materialized = 0;
+    int reorder_shared_csr = 0;
 
     // "Usage: ``./test -d 0 -aat 0 A.mtx'' for C=AA  on device 0", or
     // "Usage: ``./test -d 0 -aat 1 A.mtx'' for C=AAT on device 0"
@@ -78,6 +79,7 @@ int main(int argc, char ** argv)
     }
 
     char *filename = NULL;
+    char *filename_b = NULL;
     while (argi < argc)
     {
         if (strcmp(argv[argi], "-reorder") == 0)
@@ -91,6 +93,17 @@ int main(int argc, char ** argv)
             reorder = atoi(argv[argi]);
             argi++;
         }
+        else if (strcmp(argv[argi], "-b") == 0)
+        {
+            argi++;
+            if (argi >= argc)
+            {
+                printf("Missing value for -b.\n");
+                return 0;
+            }
+            filename_b = argv[argi];
+            argi++;
+        }
         else
         {
             filename = argv[argi];
@@ -100,18 +113,26 @@ int main(int argc, char ** argv)
 
     if (filename == NULL)
     {
-        printf("Run the code by './test -d 0 -aat 0 [-reorder 1] matrix.mtx'.\n");
+        printf("Run the code by './test -d 0 -aat 0 matrixA.mtx [-b matrixB.mtx] [-reorder 1]'.\n");
         return 0;
     }
 
  	struct timeval t1, t2;
 	SMatrix *matrixA = (SMatrix *)malloc(sizeof(SMatrix));
+    memset(matrixA, 0, sizeof(SMatrix));
 	SMatrix *matrixA_original = matrixA;
 	SMatrix *matrixA_reordered = NULL;
 	SMatrix *matrixB_reordered = NULL;
-	SMatrix *matrixB = (SMatrix *)malloc(sizeof(SMatrix));
+    SMatrix *matrixB = (SMatrix *)malloc(sizeof(SMatrix));
+    memset(matrixB, 0, sizeof(SMatrix));
+    SMatrix *matrixB_original = NULL;
+    int ab_mode = filename_b != NULL;
+    int matrixB_owns_csr = 0;
+    ReorderProblemKind reorder_kind = REORDER_PROBLEM_AA;
 
-    printf("MAT: -------------- %s --------------\n", filename);
+    printf("MAT A: -------------- %s --------------\n", filename);
+    if (ab_mode)
+        printf("MAT B: -------------- %s --------------\n", filename_b);
 
     // load mtx A data to the csr format
     gettimeofday(&t1, NULL);
@@ -120,33 +141,107 @@ int main(int argc, char ** argv)
     double time_loadmat  = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
     printf("input matrix A: ( %i, %i ) nnz = %i\n loadfile time    = %4.5f sec\n", matrixA->m, matrixA->n, matrixA->nnz, time_loadmat/1000.0);
 
-    if (!aat &&  matrixA->m != matrixA->n)
+    if (!aat && !ab_mode && matrixA->m != matrixA->n)
     {
         printf("matrix squaring must have rowA == colA. Exit.\n");
         return 0;
+    }
+    if (ab_mode)
+    {
+        if (aat)
+        {
+            printf("explicit A*B mode does not support -aat 1. Exit.\n");
+            return 0;
+        }
+
+        matrixB_original = matrixB;
+        matrixB_owns_csr = 1;
+        reorder_kind = REORDER_PROBLEM_AB;
+        gettimeofday(&t1, NULL);
+        mmio_allinone(&matrixB_original->m, &matrixB_original->n, &matrixB_original->nnz, &matrixB_original->isSymmetric,
+                      &matrixB_original->rowpointer, &matrixB_original->columnindex, &matrixB_original->value, filename_b);
+        gettimeofday(&t2, NULL);
+        double time_loadmat_b = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+        printf("input matrix B: ( %i, %i ) nnz = %i\n loadfile time    = %4.5f sec\n",
+               matrixB_original->m, matrixB_original->n, matrixB_original->nnz, time_loadmat_b / 1000.0);
+
+        if (matrixA_original->n != matrixB_original->m)
+        {
+            printf("A*B requires colA == rowB. Exit.\n");
+            return 0;
+        }
     }
 
     printf("the tilesize = %d\n",BLOCK_SIZE);
 
 	for (int i = 0; i < matrixA->nnz; i++)
 	    matrixA->value[i] = i % 10;
+    if (ab_mode)
+    {
+        for (int i = 0; i < matrixB_original->nnz; i++)
+            matrixB_original->value[i] = i % 10;
+    }
+    else if (aat)
+    {
+        MAT_PTR_TYPE *cscColPtrA;
+        int *cscRowIdxA;
+        MAT_VAL_TYPE *cscValA;
+
+        if (matrixA_original->m == matrixA_original->n && matrixA_original->isSymmetric)
+        {
+           printf("matrix AAT does not do symmetric matrix. Exit.\n");
+           return 0;
+        }
+
+        matrixB_original = matrixB;
+        matrixB_owns_csr = 1;
+        reorder_kind = REORDER_PROBLEM_AAT;
+        matrixB_original->m = matrixA_original->n;
+        matrixB_original->n = matrixA_original->m;
+        matrixB_original->nnz = matrixA_original->nnz;
+        matrixB_original->isSymmetric = 0;
+
+        cscColPtrA = (MAT_PTR_TYPE *)malloc((matrixA_original->n + 1) * sizeof(MAT_PTR_TYPE));
+        cscRowIdxA = (int *)malloc(matrixA_original->nnz * sizeof(int));
+        cscValA = (MAT_VAL_TYPE *)malloc(matrixA_original->nnz * sizeof(MAT_VAL_TYPE));
+
+        matrix_transposition(matrixA_original->m, matrixA_original->n, matrixA_original->nnz,
+                             matrixA_original->rowpointer, matrixA_original->columnindex, matrixA_original->value,
+                             cscRowIdxA, cscColPtrA, cscValA);
+
+        matrixB_original->rowpointer = cscColPtrA;
+        matrixB_original->columnindex = cscRowIdxA;
+        matrixB_original->value = cscValA;
+    }
+    else
+    {
+        reorder_kind = REORDER_PROBLEM_AA;
+        matrixB->m = matrixA_original->m;
+        matrixB->n = matrixA_original->n;
+        matrixB->nnz = matrixA_original->nnz;
+        matrixB->isSymmetric = matrixA_original->isSymmetric;
+
+        matrixB->rowpointer = matrixA_original->rowpointer;
+        matrixB->columnindex = matrixA_original->columnindex;
+        matrixB->value = matrixA_original->value;
+    }
 
     ReorderInfo reorder_info;
     reorder_info_init(&reorder_info);
 
     if (reorder)
     {
-        if (aat)
-        {
-            printf("reorder supports only -aat 0 in this version. Exit.\n");
-            return 0;
-        }
-
         printf("reorder enabled\n");
-        printf("reorder strategy = TASA-5x\n");
+        printf("reorder problem = %s\n", reorder_problem_kind_name(reorder_kind));
+        printf("reorder strategy = TASA-Fast-Unified\n");
         gettimeofday(&t1, NULL);
 
-        int reorder_status = build_gtsp_permutation(matrixA_original, &reorder_info);
+        ReorderProblem reorder_problem;
+        reorder_problem.kind = reorder_kind;
+        reorder_problem.matrixA = matrixA_original;
+        reorder_problem.matrixB = (reorder_kind == REORDER_PROBLEM_AA) ? matrixA_original : matrixB_original;
+
+        int reorder_status = build_reorder_plan(&reorder_problem, &reorder_info);
         if (reorder_status != 0)
         {
             printf("reorder failed, status = %d. Exit.\n", reorder_status);
@@ -155,12 +250,22 @@ int main(int argc, char ** argv)
 
         if (reorder_info.guard_degraded_to_identity)
         {
-            matrixB->m = matrixA_original->m;
-            matrixB->n = matrixA_original->n;
-            matrixB->nnz = matrixA_original->nnz;
-            matrixB->rowpointer = matrixA_original->rowpointer;
-            matrixB->columnindex = matrixA_original->columnindex;
-            matrixB->value = matrixA_original->value;
+            if (reorder_kind == REORDER_PROBLEM_AA)
+            {
+                matrixB->m = matrixA_original->m;
+                matrixB->n = matrixA_original->n;
+                matrixB->nnz = matrixA_original->nnz;
+                matrixB->isSymmetric = matrixA_original->isSymmetric;
+                matrixB->rowpointer = matrixA_original->rowpointer;
+                matrixB->columnindex = matrixA_original->columnindex;
+                matrixB->value = matrixA_original->value;
+                reorder_shared_csr = 1;
+            }
+            else
+            {
+                matrixB = matrixB_original;
+                reorder_shared_csr = 0;
+            }
             matrixA = matrixA_original;
         }
         else
@@ -176,13 +281,29 @@ int main(int argc, char ** argv)
                 return 0;
             }
 
-            matrixB_reordered = matrixB;
+            int aa_problem = (reorder_kind == REORDER_PROBLEM_AA);
+            matrixB_reordered = aa_problem ? matrixB : (SMatrix *)malloc(sizeof(SMatrix));
             memset(matrixB_reordered, 0, sizeof(SMatrix));
-            reorder_status = apply_bipermutation_csr(matrixA_original, &reorder_info.inner_perm, &reorder_info.col_perm, matrixB_reordered);
-            if (reorder_status != 0)
+            if (aa_problem && reorder_info.shared_symmetric_csr)
             {
-                printf("reorder apply B failed, status = %d. Exit.\n", reorder_status);
-                return 0;
+                matrixB_reordered->m = matrixA_reordered->m;
+                matrixB_reordered->n = matrixA_reordered->n;
+                matrixB_reordered->nnz = matrixA_reordered->nnz;
+                matrixB_reordered->isSymmetric = 0;
+                matrixB_reordered->rowpointer = matrixA_reordered->rowpointer;
+                matrixB_reordered->columnindex = matrixA_reordered->columnindex;
+                matrixB_reordered->value = matrixA_reordered->value;
+                reorder_shared_csr = 1;
+            }
+            else
+            {
+                SMatrix *matrixB_source = aa_problem ? matrixA_original : matrixB_original;
+                reorder_status = apply_bipermutation_csr(matrixB_source, &reorder_info.inner_perm, &reorder_info.col_perm, matrixB_reordered);
+                if (reorder_status != 0)
+                {
+                    printf("reorder apply B failed, status = %d. Exit.\n", reorder_status);
+                    return 0;
+                }
             }
             gettimeofday(&tp2, NULL);
             reorder_info.permute_time_ms = (tp2.tv_sec - tp1.tv_sec) * 1000.0 + (tp2.tv_usec - tp1.tv_usec) / 1000.0;
@@ -195,6 +316,7 @@ int main(int argc, char ** argv)
         gettimeofday(&t2, NULL);
         reorder_info.reorder_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
         printf("reorder time = %.2f ms\n", reorder_info.reorder_time_ms);
+        printf("reorder mode = %s\n", reorder_info.mode);
         printf("reorder signature time = %.2f ms\n", reorder_info.signature_time_ms);
         printf("reorder tile profile time = %.2f ms\n", reorder_info.tile_profile_time_ms);
         printf("reorder affinity time = %.2f ms\n", reorder_info.affinity_time_ms);
@@ -202,55 +324,20 @@ int main(int argc, char ** argv)
         printf("reorder local refine time = %.2f ms\n", reorder_info.local_refine_time_ms);
         printf("reorder local refine window = %d\n", reorder_info.local_refine_window);
         printf("reorder proxy time = %.2f ms\n", reorder_info.proxy_time_ms);
+        printf("reorder proxy samples = %d\n", reorder_info.proxy_sample_rows);
         printf("reorder permute time = %.2f ms\n", reorder_info.permute_time_ms);
+        printf("reorder shared csr = %d\n", reorder_shared_csr);
+        printf("risk reason = %s\n", reorder_info.risk_reason);
+        printf("risk input tile ratio = %.4f\n", reorder_info.risk_input_tile_ratio);
+        printf("risk C tile ratio = %.4f\n", reorder_info.risk_c_tile_ratio);
         if (reorder_info.guard_degraded_to_identity)
-            printf("reorder degraded to identity by proxy\n");
+            printf("reorder uses conservative identity\n");
         printf("input tiles A before reorder = %lld\n", reorder_info.input_tiles_A_before);
         printf("input tiles A after reorder = %lld\n", reorder_info.input_tiles_A_after);
         printf("input tiles B before reorder = %lld\n", reorder_info.input_tiles_B_before);
         printf("input tiles B after reorder = %lld\n", reorder_info.input_tiles_B_after);
         printf("estimated C tiles before reorder = %lld\n", reorder_info.estimated_c_tiles_before);
         printf("estimated C tiles after reorder = %lld\n", reorder_info.estimated_c_tiles_after);
-    }
-
-    if (aat)
-    {
-        MAT_PTR_TYPE *cscColPtrA;
-        int *cscRowIdxA;
-        MAT_VAL_TYPE *cscValA ;
-    
-        if (matrixA->m == matrixA->n && matrixA->isSymmetric)
-        {
-           printf("matrix AAT does not do symmetric matrix. Exit.\n");
-           return 0;
-        }
-
-        matrixB->m = matrixA->n ;
-        matrixB->n = matrixA->m ;
-        matrixB->nnz = matrixA->nnz ;
-
-        cscColPtrA = (MAT_PTR_TYPE *)malloc((matrixA->n + 1) * sizeof(MAT_PTR_TYPE));
-        cscRowIdxA = (int *)malloc(matrixA->nnz   * sizeof(int));
-        cscValA    = (MAT_VAL_TYPE *)malloc(matrixA->nnz  * sizeof(MAT_VAL_TYPE));
-
-        // transpose A from csr to csc
-        matrix_transposition(matrixA->m, matrixA->n, matrixA->nnz, matrixA->rowpointer, matrixA->columnindex, matrixA->value,cscRowIdxA, cscColPtrA, cscValA);
-
-        matrixB->rowpointer = cscColPtrA;
-        matrixB->columnindex = cscRowIdxA;
-        matrixB->value    = cscValA;
-
-
-    }
-    else if (!reorder)
-    {
-        matrixB->m = matrixA->m ;
-        matrixB->n = matrixA->n ;
-        matrixB->nnz = matrixA->nnz ;
-
-        matrixB->rowpointer = matrixA->rowpointer;
-        matrixB->columnindex = matrixA->columnindex;
-        matrixB->value    = matrixA->value;
     }
 
         // calculate bytes and flops consumed
@@ -450,7 +537,7 @@ tile2csr(matrixC);
     MAT_VAL_TYPE *csrValC_golden = matrixC->value;
 
     SMatrix *matrixA_check = reorder ? matrixA_original : matrixA;
-    SMatrix *matrixB_check = reorder ? matrixA_original : matrixB;
+    SMatrix *matrixB_check = reorder ? ((reorder_kind == REORDER_PROBLEM_AA) ? matrixA_original : matrixB_original) : matrixB;
 
     spgemm_cu(matrixA_check->m, matrixA_check->n, matrixA_check->nnz, matrixA_check->rowpointer, matrixA_check->columnindex, matrixA_check->value,
               matrixB_check->m, matrixB_check->n, matrixB_check->nnz, matrixB_check->rowpointer, matrixB_check->columnindex, matrixB_check->value,
@@ -462,18 +549,38 @@ tile2csr(matrixC);
     matrix_destroy(matrixA);
     matrix_destroy(matrixB);
 
-    free(matrixA->rowpointer);
-    free(matrixA->columnindex);
-    free(matrixA->value);
-
     if (reorder_materialized)
     {
-        free(matrixB->rowpointer);
-        free(matrixB->columnindex);
-        free(matrixB->value);
+        free(matrixA->rowpointer);
+        free(matrixA->columnindex);
+        free(matrixA->value);
+        if (!reorder_shared_csr)
+        {
+            free(matrixB->rowpointer);
+            free(matrixB->columnindex);
+            free(matrixB->value);
+        }
         free(matrixA_original->rowpointer);
         free(matrixA_original->columnindex);
         free(matrixA_original->value);
+        if (matrixB_owns_csr && matrixB_original != NULL)
+        {
+            free(matrixB_original->rowpointer);
+            free(matrixB_original->columnindex);
+            free(matrixB_original->value);
+        }
+    }
+    else
+    {
+        free(matrixA_original->rowpointer);
+        free(matrixA_original->columnindex);
+        free(matrixA_original->value);
+        if (matrixB_owns_csr && matrixB_original != NULL)
+        {
+            free(matrixB_original->rowpointer);
+            free(matrixB_original->columnindex);
+            free(matrixB_original->value);
+        }
     }
     if (reorder)
         reorder_info_destroy(&reorder_info);

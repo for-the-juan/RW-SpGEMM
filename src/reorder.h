@@ -7,6 +7,7 @@
 #include <limits.h>
 #include <numeric>
 #include <stdint.h>
+#include <string.h>
 #include <utility>
 #include <vector>
 
@@ -19,7 +20,7 @@
 #include <thrust/tuple.h>
 #include <thrust/unique.h>
 
-#define GTSP_PROXY_SAMPLE_ROWS 64
+#define GTSP_PROXY_SAMPLE_ROWS 24
 #define GTSP_PROXY_GUARD_RATIO 1.10
 
 typedef struct
@@ -50,9 +51,45 @@ typedef struct
     double local_refine_time_ms;
     double proxy_time_ms;
     double permute_time_ms;
+    double risk_input_tile_ratio;
+    double risk_c_tile_ratio;
     int local_refine_window;
+    int proxy_sample_rows;
     int guard_degraded_to_identity;
+    int structural_conservative;
+    int shared_symmetric_csr;
+    char mode[64];
+    char risk_reason[128];
 } ReorderInfo;
+
+typedef enum
+{
+    REORDER_PROBLEM_AA = 0,
+    REORDER_PROBLEM_AAT = 1,
+    REORDER_PROBLEM_AB = 2
+} ReorderProblemKind;
+
+typedef struct
+{
+    ReorderProblemKind kind;
+    const SMatrix *matrixA;
+    const SMatrix *matrixB;
+} ReorderProblem;
+
+static const char *reorder_problem_kind_name(ReorderProblemKind kind)
+{
+    switch (kind)
+    {
+    case REORDER_PROBLEM_AA:
+        return "AA";
+    case REORDER_PROBLEM_AAT:
+        return "AAT";
+    case REORDER_PROBLEM_AB:
+        return "AB";
+    default:
+        return "unknown";
+    }
+}
 
 typedef struct
 {
@@ -139,6 +176,28 @@ int axis_permutation_copy(AxisPermutation *dst, const AxisPermutation *src)
     return 0;
 }
 
+int axis_permutation_is_identity(const AxisPermutation *perm)
+{
+    if (perm == NULL || perm->old_id == NULL || perm->new_id == NULL)
+        return 0;
+    for (int i = 0; i < perm->n; i++)
+    {
+        if (perm->old_id[i] != i || perm->new_id[i] != i)
+            return 0;
+    }
+    return 1;
+}
+
+static void reorder_info_set_text(char *dst, size_t dst_size, const char *src)
+{
+    if (dst_size == 0)
+        return;
+    if (src == NULL)
+        src = "";
+    strncpy(dst, src, dst_size - 1);
+    dst[dst_size - 1] = '\0';
+}
+
 void reorder_info_init(ReorderInfo *info)
 {
     info->enabled = 0;
@@ -160,8 +219,15 @@ void reorder_info_init(ReorderInfo *info)
     info->local_refine_time_ms = 0.0;
     info->proxy_time_ms = 0.0;
     info->permute_time_ms = 0.0;
+    info->risk_input_tile_ratio = 1.0;
+    info->risk_c_tile_ratio = 1.0;
     info->local_refine_window = 0;
+    info->proxy_sample_rows = GTSP_PROXY_SAMPLE_ROWS;
     info->guard_degraded_to_identity = 0;
+    info->structural_conservative = 0;
+    info->shared_symmetric_csr = 0;
+    reorder_info_set_text(info->mode, sizeof(info->mode), "unset");
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "none");
 }
 
 void reorder_info_destroy(ReorderInfo *info)
@@ -862,6 +928,55 @@ long long estimate_symbolic_c_tile_count(const SMatrix *matrix,
     if (actual_samples == 0)
         return 0;
     return (long long)((double)total * (double)tile_count / (double)actual_samples);
+}
+
+long long estimate_symbolic_c_tile_count_ab(const SMatrix *matrixA,
+                                            const SMatrix *matrixB,
+                                            const AxisPermutation *row_perm,
+                                            const AxisPermutation *inner_perm,
+                                            const AxisPermutation *col_perm)
+{
+    if (matrixA->n != matrixB->m)
+        return 0;
+
+    int row_tile_count = (matrixA->m + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int inner_tile_count = (matrixA->n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int col_tile_count = (matrixB->n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int sample_count = row_tile_count < GTSP_PROXY_SAMPLE_ROWS ? row_tile_count : GTSP_PROXY_SAMPLE_ROWS;
+    int stride = sample_count > 0 ? (row_tile_count + sample_count - 1) / sample_count : 1;
+    long long total = 0;
+    int actual_samples = 0;
+
+#pragma omp parallel reduction(+ : total, actual_samples)
+    {
+        std::vector<int> mark(col_tile_count, 0);
+        std::vector<int> a_inner_tiles;
+        int tag = 1;
+#pragma omp for schedule(dynamic, 16)
+        for (int sample = 0; sample < sample_count; sample++)
+        {
+            int row_tile = sample * stride;
+            if (row_tile >= row_tile_count)
+                continue;
+
+            int row_count = 0;
+            tag++;
+            gtsp_collect_tile_row_cols(matrixA, row_tile, row_perm, inner_perm, a_inner_tiles);
+            for (size_t ai = 0; ai < a_inner_tiles.size(); ai++)
+            {
+                int inner_tile = a_inner_tiles[ai];
+                if (inner_tile < 0 || inner_tile >= inner_tile_count)
+                    continue;
+                row_count += gtsp_mark_tile_row_cols(matrixB, inner_tile, inner_perm, col_perm, mark, tag);
+            }
+            total += row_count;
+            actual_samples++;
+        }
+    }
+
+    if (actual_samples == 0)
+        return 0;
+    return (long long)((double)total * (double)row_tile_count / (double)actual_samples);
 }
 
 typedef struct
@@ -1642,10 +1757,12 @@ static int tasa_make_symmetric_rcm_permutation(const SMatrix *matrix,
 static int tasa_symmetric_pack_window_for_size(int n)
 {
     if (n <= 50000)
-        return 128;
+        return 32;
     if (n <= 200000)
-        return 128;
-    return 64;
+        return 64;
+    if (n <= 1000000)
+        return 64;
+    return 32;
 }
 
 static int tasa_added_tile_count(const TasaAxisSets *sets,
@@ -1796,6 +1913,258 @@ static void gtsp_set_identity_permutations(ReorderInfo *info, int n)
     axis_permutation_identity(&info->col_perm, n);
 }
 
+static double tasa_safe_ratio(long long after, long long before)
+{
+    if (before <= 0)
+        return 1.0;
+    return (double)after / (double)before;
+}
+
+static int tasa_force_active_candidate()
+{
+    const char *env = getenv("TASA_FORCE_ACTIVE");
+    return env != NULL && strcmp(env, "1") == 0;
+}
+
+static int tasa_ab_shared_symmetric_candidate()
+{
+    const char *env = getenv("TASA_AB_SHARED_SYM");
+    return env != NULL && strcmp(env, "1") == 0;
+}
+
+static void tasa_force_identity_execution(ReorderInfo *info,
+                                          int n,
+                                          const char *mode,
+                                          const char *reason)
+{
+    gtsp_set_identity_permutations(info, n);
+    info->guard_degraded_to_identity = 1;
+    info->structural_conservative = 1;
+    info->shared_symmetric_csr = 0;
+    reorder_info_set_text(info->mode, sizeof(info->mode), mode);
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), reason);
+
+    info->input_tiles_A_after = info->input_tiles_A_before;
+    info->input_tiles_B_after = info->input_tiles_B_before;
+    info->estimated_c_tiles_after = info->estimated_c_tiles_before;
+}
+
+static void tasa_apply_structural_risk_guard(ReorderInfo *info, int n)
+{
+    double input_a_ratio = tasa_safe_ratio(info->input_tiles_A_after, info->input_tiles_A_before);
+    double input_b_ratio = tasa_safe_ratio(info->input_tiles_B_after, info->input_tiles_B_before);
+    info->risk_input_tile_ratio = input_a_ratio > input_b_ratio ? input_a_ratio : input_b_ratio;
+    info->risk_c_tile_ratio = tasa_safe_ratio(info->estimated_c_tiles_after, info->estimated_c_tiles_before);
+
+    if (tasa_force_active_candidate())
+    {
+        info->structural_conservative = 0;
+        reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted_force");
+        return;
+    }
+
+    if (info->risk_c_tile_ratio > 1.15 && info->risk_input_tile_ratio > 1.10)
+    {
+        tasa_force_identity_execution(info, n, "conservative_identity", "c_and_input_tile_growth");
+        return;
+    }
+    if (info->risk_c_tile_ratio > 1.20)
+    {
+        tasa_force_identity_execution(info, n, "conservative_identity", "c_tile_growth");
+        return;
+    }
+    if (info->risk_input_tile_ratio > 1.25 && info->risk_c_tile_ratio > 0.95)
+    {
+        tasa_force_identity_execution(info, n, "conservative_identity", "input_tile_growth");
+        return;
+    }
+    if (n <= 50000 && info->risk_c_tile_ratio > 0.98 && info->risk_input_tile_ratio > 0.95)
+    {
+        tasa_force_identity_execution(info, n, "conservative_identity", "small_no_tile_gain");
+        return;
+    }
+
+    info->structural_conservative = 0;
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted");
+}
+
+static void gtsp_set_identity_permutations_ab(ReorderInfo *info, int row_n, int inner_n, int col_n)
+{
+    axis_permutation_identity(&info->row_perm, row_n);
+    axis_permutation_identity(&info->inner_perm, inner_n);
+    axis_permutation_identity(&info->col_perm, col_n);
+}
+
+static void tasa_force_identity_execution_ab(ReorderInfo *info,
+                                             int row_n,
+                                             int inner_n,
+                                             int col_n,
+                                             const char *mode,
+                                             const char *reason)
+{
+    gtsp_set_identity_permutations_ab(info, row_n, inner_n, col_n);
+    info->guard_degraded_to_identity = 1;
+    info->structural_conservative = 1;
+    info->shared_symmetric_csr = 0;
+    reorder_info_set_text(info->mode, sizeof(info->mode), mode);
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), reason);
+
+    info->input_tiles_A_after = info->input_tiles_A_before;
+    info->input_tiles_B_after = info->input_tiles_B_before;
+    info->estimated_c_tiles_after = info->estimated_c_tiles_before;
+}
+
+static void tasa_apply_structural_risk_guard_ab(ReorderInfo *info, int row_n, int inner_n, int col_n)
+{
+    double input_a_ratio = tasa_safe_ratio(info->input_tiles_A_after, info->input_tiles_A_before);
+    double input_b_ratio = tasa_safe_ratio(info->input_tiles_B_after, info->input_tiles_B_before);
+    int max_dim = row_n > inner_n ? row_n : inner_n;
+    max_dim = max_dim > col_n ? max_dim : col_n;
+
+    info->risk_input_tile_ratio = input_a_ratio > input_b_ratio ? input_a_ratio : input_b_ratio;
+    info->risk_c_tile_ratio = tasa_safe_ratio(info->estimated_c_tiles_after, info->estimated_c_tiles_before);
+
+    if (tasa_force_active_candidate())
+    {
+        info->structural_conservative = 0;
+        reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted_force");
+        return;
+    }
+
+    if (info->risk_c_tile_ratio > 1.15 && info->risk_input_tile_ratio > 1.10)
+    {
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "c_and_input_tile_growth");
+        return;
+    }
+    if (info->risk_c_tile_ratio > 1.20)
+    {
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "c_tile_growth");
+        return;
+    }
+    if (info->risk_input_tile_ratio > 1.25 && info->risk_c_tile_ratio > 0.98)
+    {
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "input_tile_growth");
+        return;
+    }
+    if (max_dim <= 50000 && info->risk_c_tile_ratio > 0.98 && info->risk_input_tile_ratio > 0.95)
+    {
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "small_no_tile_gain");
+        return;
+    }
+
+    info->structural_conservative = 0;
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted");
+}
+
+int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info);
+
+int build_gtsp_permutation_ab(const SMatrix *matrixA, const SMatrix *matrixB, ReorderInfo *info)
+{
+    if (matrixA->n != matrixB->m)
+        return -1;
+
+    struct timeval t1, t2;
+    int row_n = matrixA->m;
+    int inner_n = matrixA->n;
+    int col_n = matrixB->n;
+
+    if (tasa_ab_shared_symmetric_candidate() &&
+        matrixA->m == matrixA->n &&
+        matrixB->m == matrixB->n &&
+        matrixA->m == matrixB->m &&
+        matrixA->isSymmetric &&
+        matrixB->isSymmetric)
+    {
+        int status = build_gtsp_permutation(matrixA, info);
+        if (status != 0)
+            return status;
+
+        info->shared_symmetric_csr = 0;
+        gettimeofday(&t1, NULL);
+        info->input_tiles_A_before = estimate_input_tile_count_biperm(matrixA, NULL, NULL);
+        info->input_tiles_B_before = estimate_input_tile_count_biperm(matrixB, NULL, NULL);
+        info->input_tiles_A_after = estimate_input_tile_count_biperm(matrixA, &info->row_perm, &info->inner_perm);
+        info->input_tiles_B_after = estimate_input_tile_count_biperm(matrixB, &info->inner_perm, &info->col_perm);
+        info->estimated_c_tiles_before = estimate_symbolic_c_tile_count_ab(matrixA, matrixB, NULL, NULL, NULL);
+        info->estimated_c_tiles_after = estimate_symbolic_c_tile_count_ab(matrixA, matrixB, &info->row_perm, &info->inner_perm, &info->col_perm);
+        gettimeofday(&t2, NULL);
+        info->proxy_time_ms += (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+
+        reorder_info_set_text(info->mode, sizeof(info->mode), "active_ab_shared_symmetric");
+        tasa_apply_structural_risk_guard_ab(info, row_n, inner_n, col_n);
+        if (!info->guard_degraded_to_identity)
+            reorder_info_set_text(info->mode, sizeof(info->mode), "active_ab_shared_symmetric");
+        return 0;
+    }
+
+    reorder_info_destroy(info);
+    info->enabled = 1;
+    info->n = inner_n;
+    info->guard_degraded_to_identity = 0;
+    info->shared_symmetric_csr = 0;
+    reorder_info_set_text(info->mode, sizeof(info->mode), "active_ab");
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "pending");
+
+    int a_row_tile_dim = (matrixA->m + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int a_col_tile_dim = (matrixA->n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int b_row_tile_dim = (matrixB->m + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int b_col_tile_dim = (matrixB->n + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    int combined_dim = a_row_tile_dim > b_col_tile_dim ? a_row_tile_dim : b_col_tile_dim;
+
+    gettimeofday(&t1, NULL);
+    GtspSignatureArrays a_row_sig = gtsp_compute_row_signatures_gpu(matrixA);
+    GtspSignatureArrays a_col_sig = gtsp_compute_column_signatures_gpu(matrixA);
+    GtspSignatureArrays b_row_sig = gtsp_compute_row_signatures_gpu(matrixB);
+    GtspSignatureArrays b_col_sig = gtsp_compute_column_signatures_gpu(matrixB);
+    gettimeofday(&t2, NULL);
+    info->signature_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+
+    gettimeofday(&t1, NULL);
+    int status = gtsp_make_permutation_from_signatures(a_row_sig, a_col_tile_dim, &info->row_perm);
+    if (status != 0)
+        return -2;
+    status = gtsp_make_permutation_from_combined_signatures(a_col_sig, b_row_sig, combined_dim, &info->inner_perm);
+    if (status != 0)
+        return -3;
+    status = gtsp_make_permutation_from_signatures(b_col_sig, b_row_tile_dim, &info->col_perm);
+    if (status != 0)
+        return -4;
+    gettimeofday(&t2, NULL);
+    info->sort_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+
+    gettimeofday(&t1, NULL);
+    info->input_tiles_A_before = estimate_input_tile_count_biperm(matrixA, NULL, NULL);
+    info->input_tiles_B_before = estimate_input_tile_count_biperm(matrixB, NULL, NULL);
+    info->input_tiles_A_after = estimate_input_tile_count_biperm(matrixA, &info->row_perm, &info->inner_perm);
+    info->input_tiles_B_after = estimate_input_tile_count_biperm(matrixB, &info->inner_perm, &info->col_perm);
+    info->estimated_c_tiles_before = estimate_symbolic_c_tile_count_ab(matrixA, matrixB, NULL, NULL, NULL);
+    info->estimated_c_tiles_after = estimate_symbolic_c_tile_count_ab(matrixA, matrixB, &info->row_perm, &info->inner_perm, &info->col_perm);
+    gettimeofday(&t2, NULL);
+    info->proxy_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+
+    tasa_apply_structural_risk_guard_ab(info, row_n, inner_n, col_n);
+    if (!info->guard_degraded_to_identity)
+        reorder_info_set_text(info->mode, sizeof(info->mode), "active_ab");
+
+    return 0;
+}
+
+int build_gtsp_permutation_aat(const SMatrix *matrixA, const SMatrix *matrixAT, ReorderInfo *info)
+{
+    if (matrixA == NULL || matrixAT == NULL || info == NULL)
+        return -1;
+    if (matrixA->n != matrixAT->m || matrixA->m != matrixAT->n)
+        return -2;
+
+    int status = build_gtsp_permutation_ab(matrixA, matrixAT, info);
+    if (status != 0)
+        return status;
+
+    if (!info->guard_degraded_to_identity)
+        reorder_info_set_text(info->mode, sizeof(info->mode), "active_aat");
+    return 0;
+}
+
 int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info)
 {
     if (matrix->m != matrix->n)
@@ -1808,6 +2177,8 @@ int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info)
     info->enabled = 1;
     info->n = n;
     info->guard_degraded_to_identity = 0;
+    reorder_info_set_text(info->mode, sizeof(info->mode), "active");
+    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "pending");
 
     if (!matrix->isSymmetric)
     {
@@ -1843,6 +2214,8 @@ int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info)
         info->estimated_c_tiles_after = estimate_symbolic_c_tile_count(matrix, &info->row_perm, &info->inner_perm, &info->col_perm);
         gettimeofday(&t2, NULL);
         info->proxy_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+        reorder_info_set_text(info->mode, sizeof(info->mode), "active_general");
+        tasa_apply_structural_risk_guard(info, n);
         return 0;
     }
 
@@ -1877,16 +2250,26 @@ int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info)
         int tile_dim = (n + BLOCK_SIZE - 1) / BLOCK_SIZE;
         long long natural_tiles = tasa_count_input_tiles_from_row_sets(&row_sets, n);
         double avg_tiles_per_tile_row = tile_dim > 0 ? (double)natural_tiles / (double)tile_dim : 0.0;
+        int identity_direct = 0;
         if (n <= 50000 && avg_tiles_per_tile_row < 32.0)
         {
-            info->local_refine_window = BLOCK_SIZE;
+            info->local_refine_window = 0;
             status = axis_permutation_identity(&info->inner_perm, n);
             if (status != 0)
                 return -2;
+            identity_direct = 1;
+            info->input_tiles_A_before = natural_tiles;
+            info->input_tiles_B_before = natural_tiles;
+            info->input_tiles_A_after = natural_tiles;
+            info->input_tiles_B_after = natural_tiles;
+            info->estimated_c_tiles_before = 0;
+            info->estimated_c_tiles_after = 0;
+            reorder_info_set_text(info->mode, sizeof(info->mode), "identity_narrow_tiles");
+            reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "natural_tile_rows_compact");
         }
         else if (n <= 50000)
         {
-            info->local_refine_window = 128;
+            info->local_refine_window = 32;
             status = tasa_make_symmetric_rcm_permutation(matrix,
                                                          &row_sets,
                                                          &info->inner_perm,
@@ -1914,6 +2297,14 @@ int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info)
         status = axis_permutation_copy(&info->col_perm, &info->inner_perm);
         if (status != 0)
             return -4;
+
+        if (identity_direct)
+        {
+            tasa_force_identity_execution(info, n, "identity_narrow_tiles", "natural_tile_rows_compact");
+            info->risk_input_tile_ratio = 1.0;
+            info->risk_c_tile_ratio = 1.0;
+            return 0;
+        }
     }
     else
     {
@@ -2020,8 +2411,34 @@ int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info)
     info->estimated_c_tiles_after = estimate_symbolic_c_tile_count(matrix, &info->row_perm, &info->inner_perm, &info->col_perm);
     gettimeofday(&t2, NULL);
     info->proxy_time_ms = (t2.tv_sec - t1.tv_sec) * 1000.0 + (t2.tv_usec - t1.tv_usec) / 1000.0;
+    reorder_info_set_text(info->mode, sizeof(info->mode), matrix->isSymmetric ? "active_symmetric" : "active_general");
+    tasa_apply_structural_risk_guard(info, n);
+    if (matrix->isSymmetric && !info->guard_degraded_to_identity)
+        info->shared_symmetric_csr = 1;
 
     return 0;
+}
+
+int build_reorder_plan(const ReorderProblem *problem, ReorderInfo *info)
+{
+    if (problem == NULL || info == NULL || problem->matrixA == NULL)
+        return -1;
+
+    switch (problem->kind)
+    {
+    case REORDER_PROBLEM_AA:
+        return build_gtsp_permutation(problem->matrixA, info);
+    case REORDER_PROBLEM_AAT:
+        if (problem->matrixB == NULL)
+            return -3;
+        return build_gtsp_permutation_aat(problem->matrixA, problem->matrixB, info);
+    case REORDER_PROBLEM_AB:
+        if (problem->matrixB == NULL)
+            return -3;
+        return build_gtsp_permutation_ab(problem->matrixA, problem->matrixB, info);
+    default:
+        return -2;
+    }
 }
 
 int apply_bipermutation_csr(const SMatrix *input,
