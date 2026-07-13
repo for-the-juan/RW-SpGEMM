@@ -1,0 +1,18 @@
+#!/usr/bin/env python3
+import sys
+import os
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "common"))
+from order_utils import run_native
+
+if os.environ.get("TASA_ENABLE_UNSAFE_RANDOM") != "1":
+    print(
+        "missing_dependency: random reorder is disabled by default because it failed SpGEMM correctness; "
+        "set TASA_ENABLE_UNSAFE_RANDOM=1 to run it as an unsafe experiment",
+        file=sys.stderr,
+    )
+    sys.exit(42)
+
+sys.exit(run_native("random", sys.argv))

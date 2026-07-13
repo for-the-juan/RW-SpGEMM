@@ -10,13 +10,14 @@
 #include "spgemm_serialref_spa_new.h"
 #include "spgemm_cu.h"
 #include "reorder.h"
+#include "external_reorder.h"
 
 int main(int argc, char ** argv)
 {
 
 	if (argc < 6)
     {
-        printf("Run the code by './test -d 0 -aat 0 matrixA.mtx [-b matrixB.mtx] [-reorder 1]'.\n");
+        printf("Run the code by './test -d 0 -aat 0 matrixA.mtx [-b matrixB.mtx] [-reorder 1] [-reorder_algo tasa|degree|rcm|...]'.\n");
         return 0;
     }
 	
@@ -27,6 +28,8 @@ int main(int argc, char ** argv)
     int reorder = 0;
     int reorder_materialized = 0;
     int reorder_shared_csr = 0;
+    const char *reorder_algo = "tasa";
+    double reorder_ordergen_time_ms = 0.0;
 
     // "Usage: ``./test -d 0 -aat 0 A.mtx'' for C=AA  on device 0", or
     // "Usage: ``./test -d 0 -aat 1 A.mtx'' for C=AAT on device 0"
@@ -104,6 +107,17 @@ int main(int argc, char ** argv)
             filename_b = argv[argi];
             argi++;
         }
+        else if (strcmp(argv[argi], "-reorder_algo") == 0)
+        {
+            argi++;
+            if (argi >= argc)
+            {
+                printf("Missing value for -reorder_algo.\n");
+                return 0;
+            }
+            reorder_algo = argv[argi];
+            argi++;
+        }
         else
         {
             filename = argv[argi];
@@ -113,7 +127,7 @@ int main(int argc, char ** argv)
 
     if (filename == NULL)
     {
-        printf("Run the code by './test -d 0 -aat 0 matrixA.mtx [-b matrixB.mtx] [-reorder 1]'.\n");
+        printf("Run the code by './test -d 0 -aat 0 matrixA.mtx [-b matrixB.mtx] [-reorder 1] [-reorder_algo tasa|degree|rcm|...]'.\n");
         return 0;
     }
 
@@ -233,19 +247,51 @@ int main(int argc, char ** argv)
     {
         printf("reorder enabled\n");
         printf("reorder problem = %s\n", reorder_problem_kind_name(reorder_kind));
-        printf("reorder strategy = TASA-Fast-Unified\n");
+        printf("reorder algorithm = %s\n", reorder_algo);
+        printf("reorder strategy = %s\n", strcmp(reorder_algo, "tasa") == 0 ? "TASA-Fast-Unified" : "External-Order");
         gettimeofday(&t1, NULL);
 
-        ReorderProblem reorder_problem;
-        reorder_problem.kind = reorder_kind;
-        reorder_problem.matrixA = matrixA_original;
-        reorder_problem.matrixB = (reorder_kind == REORDER_PROBLEM_AA) ? matrixA_original : matrixB_original;
-
-        int reorder_status = build_reorder_plan(&reorder_problem, &reorder_info);
-        if (reorder_status != 0)
+        int reorder_status = 0;
+        if (strcmp(reorder_algo, "tasa") == 0)
         {
-            printf("reorder failed, status = %d. Exit.\n", reorder_status);
-            return 0;
+            ReorderProblem reorder_problem;
+            reorder_problem.kind = reorder_kind;
+            reorder_problem.matrixA = matrixA_original;
+            reorder_problem.matrixB = (reorder_kind == REORDER_PROBLEM_AA) ? matrixA_original : matrixB_original;
+
+            reorder_status = build_reorder_plan(&reorder_problem, &reorder_info);
+            if (reorder_status != 0)
+            {
+                printf("reorder failed, status = %d. Exit.\n", reorder_status);
+                return 0;
+            }
+        }
+        else if (strcmp(reorder_algo, "original") == 0)
+        {
+            SMatrix *reorder_matrixB = (reorder_kind == REORDER_PROBLEM_AA) ? matrixA_original : matrixB_original;
+            reorder_status = build_original_reorder_plan(reorder_kind, matrixA_original, reorder_matrixB, &reorder_info);
+            if (reorder_status != 0)
+            {
+                printf("original reorder plan failed, status = %d. Exit.\n", reorder_status);
+                return 0;
+            }
+        }
+        else
+        {
+            SMatrix *reorder_matrixB = (reorder_kind == REORDER_PROBLEM_AA) ? matrixA_original : matrixB_original;
+            reorder_status = build_external_reorder_plan(reorder_kind,
+                                                          reorder_algo,
+                                                          filename,
+                                                          filename_b,
+                                                          matrixA_original,
+                                                          reorder_matrixB,
+                                                          &reorder_info,
+                                                          &reorder_ordergen_time_ms);
+            if (reorder_status != 0)
+            {
+                printf("external reorder failed, status = %d. Exit.\n", reorder_status);
+                return 0;
+            }
         }
 
         if (reorder_info.guard_degraded_to_identity)
@@ -325,7 +371,9 @@ int main(int argc, char ** argv)
         printf("reorder local refine window = %d\n", reorder_info.local_refine_window);
         printf("reorder proxy time = %.2f ms\n", reorder_info.proxy_time_ms);
         printf("reorder proxy samples = %d\n", reorder_info.proxy_sample_rows);
+        printf("reorder ordergen time = %.2f ms\n", reorder_ordergen_time_ms);
         printf("reorder permute time = %.2f ms\n", reorder_info.permute_time_ms);
+        printf("reorder preprocess time = %.2f ms\n", reorder_ordergen_time_ms + reorder_info.permute_time_ms);
         printf("reorder shared csr = %d\n", reorder_shared_csr);
         printf("risk reason = %s\n", reorder_info.risk_reason);
         printf("risk input tile ratio = %.4f\n", reorder_info.risk_input_tile_ratio);

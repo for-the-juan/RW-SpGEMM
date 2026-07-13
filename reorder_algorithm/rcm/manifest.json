@@ -1,0 +1,1 @@
+{"name":"rcm","type":"native_scipy","source":"SciPy reverse_cuthill_mckee / libmtx RCM equivalent","order_format":"new_to_old_zero_based","dependencies":["python3","scipy"]}

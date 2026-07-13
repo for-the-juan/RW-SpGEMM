@@ -1,0 +1,1 @@
+{"name":"rabbit","type":"external","source":"/home/hangcheng.dong/PPoPP27/reordering-spgemm/rabbit_order","order_format":"new_to_old_zero_based","dependencies":["boost","numa","tcmalloc optional","rabbit_order binaries"]}

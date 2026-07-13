@@ -1949,43 +1949,15 @@ static void tasa_force_identity_execution(ReorderInfo *info,
     info->estimated_c_tiles_after = info->estimated_c_tiles_before;
 }
 
+static void tasa_apply_structural_risk_guard_common(ReorderInfo *info,
+                                                    int row_n,
+                                                    int inner_n,
+                                                    int col_n,
+                                                    double input_growth_c_ratio_limit);
+
 static void tasa_apply_structural_risk_guard(ReorderInfo *info, int n)
 {
-    double input_a_ratio = tasa_safe_ratio(info->input_tiles_A_after, info->input_tiles_A_before);
-    double input_b_ratio = tasa_safe_ratio(info->input_tiles_B_after, info->input_tiles_B_before);
-    info->risk_input_tile_ratio = input_a_ratio > input_b_ratio ? input_a_ratio : input_b_ratio;
-    info->risk_c_tile_ratio = tasa_safe_ratio(info->estimated_c_tiles_after, info->estimated_c_tiles_before);
-
-    if (tasa_force_active_candidate())
-    {
-        info->structural_conservative = 0;
-        reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted_force");
-        return;
-    }
-
-    if (info->risk_c_tile_ratio > 1.15 && info->risk_input_tile_ratio > 1.10)
-    {
-        tasa_force_identity_execution(info, n, "conservative_identity", "c_and_input_tile_growth");
-        return;
-    }
-    if (info->risk_c_tile_ratio > 1.20)
-    {
-        tasa_force_identity_execution(info, n, "conservative_identity", "c_tile_growth");
-        return;
-    }
-    if (info->risk_input_tile_ratio > 1.25 && info->risk_c_tile_ratio > 0.95)
-    {
-        tasa_force_identity_execution(info, n, "conservative_identity", "input_tile_growth");
-        return;
-    }
-    if (n <= 50000 && info->risk_c_tile_ratio > 0.98 && info->risk_input_tile_ratio > 0.95)
-    {
-        tasa_force_identity_execution(info, n, "conservative_identity", "small_no_tile_gain");
-        return;
-    }
-
-    info->structural_conservative = 0;
-    reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted");
+    tasa_apply_structural_risk_guard_common(info, n, n, n, 0.95);
 }
 
 static void gtsp_set_identity_permutations_ab(ReorderInfo *info, int row_n, int inner_n, int col_n)
@@ -2014,7 +1986,11 @@ static void tasa_force_identity_execution_ab(ReorderInfo *info,
     info->estimated_c_tiles_after = info->estimated_c_tiles_before;
 }
 
-static void tasa_apply_structural_risk_guard_ab(ReorderInfo *info, int row_n, int inner_n, int col_n)
+static void tasa_apply_structural_risk_guard_common(ReorderInfo *info,
+                                                    int row_n,
+                                                    int inner_n,
+                                                    int col_n,
+                                                    double input_growth_c_ratio_limit)
 {
     double input_a_ratio = tasa_safe_ratio(info->input_tiles_A_after, info->input_tiles_A_before);
     double input_b_ratio = tasa_safe_ratio(info->input_tiles_B_after, info->input_tiles_B_before);
@@ -2033,27 +2009,36 @@ static void tasa_apply_structural_risk_guard_ab(ReorderInfo *info, int row_n, in
 
     if (info->risk_c_tile_ratio > 1.15 && info->risk_input_tile_ratio > 1.10)
     {
-        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "c_and_input_tile_growth");
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n,
+                                         "conservative_identity", "c_and_input_tile_growth");
         return;
     }
     if (info->risk_c_tile_ratio > 1.20)
     {
-        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "c_tile_growth");
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n,
+                                         "conservative_identity", "c_tile_growth");
         return;
     }
-    if (info->risk_input_tile_ratio > 1.25 && info->risk_c_tile_ratio > 0.98)
+    if (info->risk_input_tile_ratio > 1.25 && info->risk_c_tile_ratio > input_growth_c_ratio_limit)
     {
-        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "input_tile_growth");
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n,
+                                         "conservative_identity", "input_tile_growth");
         return;
     }
     if (max_dim <= 50000 && info->risk_c_tile_ratio > 0.98 && info->risk_input_tile_ratio > 0.95)
     {
-        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n, "conservative_identity", "small_no_tile_gain");
+        tasa_force_identity_execution_ab(info, row_n, inner_n, col_n,
+                                         "conservative_identity", "small_no_tile_gain");
         return;
     }
 
     info->structural_conservative = 0;
     reorder_info_set_text(info->risk_reason, sizeof(info->risk_reason), "accepted");
+}
+
+static void tasa_apply_structural_risk_guard_ab(ReorderInfo *info, int row_n, int inner_n, int col_n)
+{
+    tasa_apply_structural_risk_guard_common(info, row_n, inner_n, col_n, 0.98);
 }
 
 int build_gtsp_permutation(const SMatrix *matrix, ReorderInfo *info);

@@ -66,7 +66,7 @@
 
 #define DEBUG 1
 
-#define REPEAT_NUM 1
+#define REPEAT_NUM 5
 
 #ifndef TIMING
 #define TIMING 1
